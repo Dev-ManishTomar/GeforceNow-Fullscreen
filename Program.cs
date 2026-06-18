@@ -6,7 +6,6 @@ using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Controls;
-using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using Microsoft.Win32;
 
@@ -128,19 +127,24 @@ static class Program
 
         void FadeOutAndHandoff()
         {
-            var fadeIn = new DoubleAnimation(0.0, 1.0, TimeSpan.FromMilliseconds(800))
+            const int fadeDurationMs = 800;
+            const int stepMs = 16;
+            double step = (double)stepMs / fadeDurationMs;
+
+            var fadeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(stepMs) };
+            fadeTimer.Tick += (_, _) =>
             {
-                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseIn }
+                fadeOverlay.Opacity = Math.Min(fadeOverlay.Opacity + step, 1.0);
+                if (fadeOverlay.Opacity >= 1.0)
+                {
+                    fadeTimer.Stop();
+                    StripTitleBar(gfnHwnd);
+                    LockSetForegroundWindow(LSFW_UNLOCK);
+                    SetForegroundWindow(gfnHwnd);
+                    window.Close();
+                }
             };
-            fadeIn.Completed += (_, _) =>
-            {
-                StripTitleBar(gfnHwnd);
-                ShowWindow(gfnHwnd, SW_SHOW);
-                LockSetForegroundWindow(LSFW_UNLOCK);
-                SetForegroundWindow(gfnHwnd);
-                window.Close();
-            };
-            fadeOverlay.BeginAnimation(UIElement.OpacityProperty, fadeIn);
+            fadeTimer.Start();
         }
 
         void OnSplashEnded()
@@ -198,9 +202,9 @@ static class Program
                 Process.Start(new ProcessStartInfo { FileName = gfnPath, UseShellExecute = true });
             }
 
-            // Monitor GFN: hide its window immediately when it appears
-            var hideTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
-            hideTimer.Tick += (_, _) =>
+            // Detect GFN window handle (runs behind Topmost splash, not hidden)
+            var detectTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
+            detectTimer.Tick += (_, _) =>
             {
                 if (gfnHwnd != IntPtr.Zero) return;
 
@@ -208,11 +212,10 @@ static class Program
                 if (proc != null && proc.MainWindowHandle != IntPtr.Zero)
                 {
                     gfnHwnd = proc.MainWindowHandle;
-                    ShowWindow(gfnHwnd, SW_HIDE);
-                    hideTimer.Stop();
+                    detectTimer.Stop();
                 }
             };
-            hideTimer.Start();
+            detectTimer.Start();
         };
 
         window.Closed += (_, _) =>
@@ -222,6 +225,7 @@ static class Program
         };
 
         app.Run(window);
+        Environment.Exit(0);
     }
 
     static void WaitAndStripTitleBar()
@@ -354,9 +358,6 @@ static class Program
     const uint RDW_FRAME = 0x0400;
     const uint RDW_ERASE = 0x0004;
 
-    const int SW_HIDE = 0;
-    const int SW_SHOW = 5;
-
     static readonly IntPtr HWND_TOPMOST = new(-1);
     static readonly IntPtr HWND_NOTOPMOST = new(-2);
 
@@ -383,9 +384,6 @@ static class Program
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     static extern bool SetForegroundWindow(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
     [DllImport("user32.dll")]
     static extern bool LockSetForegroundWindow(uint uLockCode);
