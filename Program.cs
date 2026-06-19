@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
-using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Controls;
@@ -17,8 +16,6 @@ static class Program
     const string GfnRelativePath = @"NVIDIA Corporation\GeForceNOW\CEF\GeForceNOW.exe";
     const string GfnJsonRelativePath = @"NVIDIA Corporation\GeForceNOW\CEF\GeForceNOW.json";
     const string RunKeyName = "GfnFullscreen";
-
-    static bool _titleBarStripped;
 
     [STAThread]
     static int Main(string[] args)
@@ -48,11 +45,12 @@ static class Program
         if (gfnPath == null)
             return 1;
 
-        // If GFN is already running, just strip its titlebar and exit
+        // If GFN is already running, strip its titlebar and monitor
         var existingProc = FindGfnProcess();
         if (existingProc != null && existingProc.MainWindowHandle != IntPtr.Zero)
         {
             StripTitleBar(existingProc.MainWindowHandle);
+            MonitorGfn();
             return 0;
         }
 
@@ -67,6 +65,8 @@ static class Program
             Process.Start(new ProcessStartInfo { FileName = gfnPath, UseShellExecute = true });
             WaitAndStripTitleBar();
         }
+
+        MonitorGfn();
 
         return 0;
     }
@@ -225,7 +225,87 @@ static class Program
         };
 
         app.Run(window);
-        Environment.Exit(0);
+    }
+
+    [DllImport("user32.dll")]
+    static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    static bool IsGfnWindow(IntPtr hwnd)
+    {
+        GetWindowThreadProcessId(hwnd, out uint pid);
+        try
+        {
+            var proc = Process.GetProcessById((int)pid);
+            return proc.ProcessName.Equals(GfnProcessName, StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    static void EnsureAllGfnStripped()
+    {
+        var procs = Process.GetProcessesByName(GfnProcessName);
+        foreach (var proc in procs)
+        {
+            if (proc.MainWindowHandle != IntPtr.Zero)
+            {
+                long style = GetWindowLongPtr(proc.MainWindowHandle, GWL_STYLE);
+                if ((style & WS_CAPTION) != 0)
+                    StripTitleBar(proc.MainWindowHandle);
+            }
+            proc.Dispose();
+        }
+    }
+
+    static void MonitorGfn()
+    {
+        uint threadId = GetCurrentThreadId();
+
+        WinEventDelegate callback = (hook, eventType, hwnd, idObject, idChild, eventThread, eventTime) =>
+        {
+            if (hwnd == IntPtr.Zero || idObject != OBJID_WINDOW) return;
+            if (!IsGfnWindow(hwnd)) return;
+
+            long style = GetWindowLongPtr(hwnd, GWL_STYLE);
+            if ((style & WS_CAPTION) != 0)
+                StripTitleBar(hwnd);
+        };
+
+        var pinned = GCHandle.Alloc(callback);
+
+        var hook1 = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+            IntPtr.Zero, callback, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        var hook2 = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
+            IntPtr.Zero, callback, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        var hook3 = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
+            IntPtr.Zero, callback, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+        SetTimer(IntPtr.Zero, UIntPtr.Zero, 500, IntPtr.Zero);
+
+        Task.Run(() =>
+        {
+            while (true)
+            {
+                Thread.Sleep(2000);
+                var procs = Process.GetProcessesByName(GfnProcessName);
+                if (procs.Length == 0) break;
+                foreach (var p in procs) p.Dispose();
+            }
+            PostThreadMessage(threadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
+        });
+
+        while (GetMessage(out var msg, IntPtr.Zero, 0, 0))
+        {
+            if (msg.message == WM_TIMER)
+                EnsureAllGfnStripped();
+
+            TranslateMessage(ref msg);
+            DispatchMessage(ref msg);
+        }
+
+        UnhookWinEvent(hook1);
+        UnhookWinEvent(hook2);
+        UnhookWinEvent(hook3);
+        pinned.Free();
     }
 
     static void WaitAndStripTitleBar()
@@ -244,12 +324,8 @@ static class Program
 
     static void StripTitleBar(IntPtr hwnd)
     {
-        if (hwnd == IntPtr.Zero || _titleBarStripped)
+        if (hwnd == IntPtr.Zero)
             return;
-
-        _titleBarStripped = true;
-
-        SendMessage(hwnd, WM_SETREDRAW, IntPtr.Zero, IntPtr.Zero);
 
         long style = GetWindowLongPtr(hwnd, GWL_STYLE);
         style &= ~(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU |
@@ -259,12 +335,7 @@ static class Program
 
         int w = GetSystemMetrics(SM_CXSCREEN);
         int h = GetSystemMetrics(SM_CYSCREEN);
-        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, w, h, SWP_FRAMECHANGED);
-        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, w, h, SWP_FRAMECHANGED);
-
-        SendMessage(hwnd, WM_SETREDRAW, (IntPtr)1, IntPtr.Zero);
-        RedrawWindow(hwnd, IntPtr.Zero, IntPtr.Zero,
-            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_ERASE);
+        SetWindowPos(hwnd, IntPtr.Zero, 0, 0, w, h, SWP_FRAMECHANGED | SWP_NOZORDER);
     }
 
     static void EnsureNativeTitleBar()
@@ -284,6 +355,13 @@ static class Program
         catch { }
     }
 
+    static string? ResolveGfnJsonPath()
+    {
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var path = Path.Combine(localAppData, GfnJsonRelativePath);
+        return File.Exists(path) ? path : null;
+    }
+
     static Process? FindGfnProcess()
     {
         var procs = Process.GetProcessesByName(GfnProcessName);
@@ -301,13 +379,6 @@ static class Program
         return File.Exists(Path.Combine(localAppData, GfnRelativePath))
             ? Path.Combine(localAppData, GfnRelativePath)
             : null;
-    }
-
-    static string? ResolveGfnJsonPath()
-    {
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var path = Path.Combine(localAppData, GfnJsonRelativePath);
-        return File.Exists(path) ? path : null;
     }
 
     static string? FindSplashPath()
@@ -350,16 +421,7 @@ static class Program
     const int SM_CYSCREEN = 1;
 
     const uint SWP_FRAMECHANGED = 0x0020;
-    const uint SWP_NOMOVE = 0x0002;
-    const uint SWP_NOSIZE = 0x0001;
-    const int WM_SETREDRAW = 0x000B;
-    const uint RDW_INVALIDATE = 0x0001;
-    const uint RDW_ALLCHILDREN = 0x0080;
-    const uint RDW_FRAME = 0x0400;
-    const uint RDW_ERASE = 0x0004;
-
-    static readonly IntPtr HWND_TOPMOST = new(-1);
-    static readonly IntPtr HWND_NOTOPMOST = new(-2);
+    const uint SWP_NOZORDER = 0x0004;
 
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
     static extern long GetWindowLongPtr(IntPtr hWnd, int nIndex);
@@ -375,13 +437,6 @@ static class Program
     static extern int GetSystemMetrics(int nIndex);
 
     [DllImport("user32.dll")]
-    static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("user32.dll")]
-    static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate,
-        IntPtr hrgnUpdate, uint flags);
-
-    [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     static extern bool SetForegroundWindow(IntPtr hWnd);
 
@@ -389,4 +444,56 @@ static class Program
     static extern bool LockSetForegroundWindow(uint uLockCode);
     const uint LSFW_LOCK = 1;
     const uint LSFW_UNLOCK = 2;
+
+    // ── Event Hook Interop ──────────────────────────────────────
+
+    delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType,
+        IntPtr hwnd, int idObject, int idChild, uint eventThread, uint eventTime);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax,
+        IntPtr hmodWinEventProc, WinEventDelegate lpfnWinEventProc,
+        uint idProcess, uint idThread, uint dwFlags);
+
+    [DllImport("user32.dll")]
+    static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+
+    [DllImport("user32.dll")]
+    static extern bool GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+
+    [DllImport("user32.dll")]
+    static extern bool TranslateMessage(ref MSG lpMsg);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr DispatchMessage(ref MSG lpMsg);
+
+    [DllImport("user32.dll")]
+    static extern bool PostThreadMessage(uint idThread, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll")]
+    static extern uint GetCurrentThreadId();
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct MSG
+    {
+        public IntPtr hwnd;
+        public uint message;
+        public IntPtr wParam;
+        public IntPtr lParam;
+        public uint time;
+        public int ptX;
+        public int ptY;
+    }
+
+    const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    const uint EVENT_OBJECT_SHOW = 0x8002;
+    const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
+    const uint WINEVENT_OUTOFCONTEXT = 0x0000;
+    const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
+    const uint WM_QUIT = 0x0012;
+    const uint WM_TIMER = 0x0113;
+    const int OBJID_WINDOW = 0;
+
+    [DllImport("user32.dll")]
+    static extern UIntPtr SetTimer(IntPtr hWnd, UIntPtr nIDEvent, uint uElapse, IntPtr lpTimerFunc);
 }
