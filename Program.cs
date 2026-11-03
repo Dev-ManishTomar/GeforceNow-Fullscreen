@@ -16,9 +16,23 @@ static class Program
     const string GfnRelativePath = @"NVIDIA Corporation\GeForceNOW\CEF\GeForceNOW.exe";
     const string GfnJsonRelativePath = @"NVIDIA Corporation\GeForceNOW\CEF\GeForceNOW.json";
     const string RunKeyName = "GfnFullscreen";
+    const string LaunchEventName = @"Local\GfnFullscreen_Launch";
+
+    // How long to keep watching after GFN disappears (covers updater restarts).
+    static readonly TimeSpan MonitorGraceAfterExit = TimeSpan.FromMinutes(3);
 
     [STAThread]
     static int Main(string[] args)
+    {
+        try { return Run(args); }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "GfnFullscreen could not start", MessageBoxButton.OK, MessageBoxImage.Error);
+            return 1;
+        }
+    }
+
+    static int Run(string[] args)
     {
         bool install = args.Contains("--install");
         bool uninstall = args.Contains("--uninstall");
@@ -35,46 +49,127 @@ static class Program
             return 0;
         }
 
-        using var mutex = new Mutex(true, @"Global\GfnFullscreen_SingleInstance", out bool created);
+        using var launchEvent = new EventWaitHandle(false, EventResetMode.AutoReset, LaunchEventName);
+        using var mutex = new Mutex(true, @"Local\GfnFullscreen_SingleInstance", out bool created);
         if (!created)
-            return 0;
-
-        EnsureNativeTitleBar();
-
-        var gfnPath = ResolveGfnPath();
-        if (gfnPath == null)
-            return 1;
-
-        // If GFN is already running, strip its titlebar and monitor
-        var existingProc = FindGfnProcess();
-        if (existingProc != null && existingProc.MainWindowHandle != IntPtr.Zero)
         {
-            StripTitleBar(existingProc.MainWindowHandle);
-            MonitorGfn();
+            launchEvent.Set();
             return 0;
         }
 
-        // Show splash FIRST, launch GFN after splash is visible
+        // Apply update-reset settings before starting GFN, never interrupt a session.
+        if (!IsGfnRunning())
+            EnsureNativeTitleBar();
+
+        var gfnPath = ResolveGfnPath();
+        if (gfnPath == null)
+        {
+            MessageBox.Show("GeForce NOW was not found in its default installation folder. Check that it is installed for this Windows user.", "GfnFullscreen", MessageBoxButton.OK, MessageBoxImage.Error);
+            return 1;
+        }
+
+        var existingHwnd = FindGfnMainHwnd();
+        if (existingHwnd != IntPtr.Zero)
+        {
+            if (!ShowMpvSplash(gfnPath, launchGfn: false))
+            {
+                if (IsIconic(existingHwnd)) ShowWindow(existingHwnd, SW_RESTORE);
+                ForceFullscreen(existingHwnd);
+                SetForegroundWindow(existingHwnd);
+            }
+            MonitorGfn(launchEvent, gfnPath);
+            return 0;
+        }
+
         var splashPath = FindSplashPath();
-        if (splashPath != null)
+        if (ShowMpvSplash(gfnPath, launchGfn: true))
+        {
+            // MPV handled the splash and launch.
+        }
+        else if (splashPath != null)
         {
             ShowSplashThenLaunchGfn(splashPath, gfnPath);
         }
         else
         {
             Process.Start(new ProcessStartInfo { FileName = gfnPath, UseShellExecute = true });
-            WaitAndStripTitleBar();
+            WaitAndForceFullscreen();
         }
 
-        MonitorGfn();
-
+        MonitorGfn(launchEvent, gfnPath);
         return 0;
+    }
+
+    // Hold the final black frame until both the animation and app startup finish.
+    static bool ShowMpvSplash(string gfnPath, bool launchGfn)
+    {
+        string mpvPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "MPV Player", "mpv.exe");
+        string videoPath = Path.Combine(AppContext.BaseDirectory, "nvidia-splash.mp4");
+        if (!File.Exists(mpvPath) || !File.Exists(videoPath)) return false;
+
+        Process? player = null;
+        bool startedGfn = false;
+        try
+        {
+            var options = new ProcessStartInfo { FileName = mpvPath, UseShellExecute = false, CreateNoWindow = true };
+            foreach (var arg in new[] { "--no-config", "--fullscreen", "--ontop", "--no-audio", "--no-osc", "--no-input-default-bindings", "--keep-open=yes", "--title=GfnFullscreenSplash", videoPath })
+                options.ArgumentList.Add(arg);
+            player = Process.Start(options);
+            if (player == null) return false;
+
+            var readyBy = Stopwatch.StartNew();
+            while (readyBy.Elapsed < TimeSpan.FromSeconds(5))
+            {
+                player.Refresh();
+                if (player.HasExited) return false;
+                if (player.MainWindowHandle != IntPtr.Zero) break;
+                Thread.Sleep(50);
+            }
+            player.Refresh();
+            if (player.MainWindowHandle == IntPtr.Zero) return false;
+
+            var playback = Stopwatch.StartNew();
+            if (launchGfn)
+            {
+                Process.Start(new ProcessStartInfo { FileName = gfnPath, UseShellExecute = true });
+                startedGfn = true;
+            }
+
+            IntPtr hwnd = IntPtr.Zero;
+            while (playback.Elapsed < TimeSpan.FromSeconds(45))
+            {
+                hwnd = FindGfnMainHwnd();
+                if (hwnd != IntPtr.Zero && playback.Elapsed >= TimeSpan.FromSeconds(3.1)) break;
+                if (player.HasExited) break;
+                Thread.Sleep(100);
+            }
+            if (hwnd != IntPtr.Zero)
+            {
+                if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+                ForceFullscreen(hwnd);
+            }
+            player.CloseMainWindow();
+            if (!player.WaitForExit(1500)) player.Kill();
+            if (hwnd != IntPtr.Zero) SetForegroundWindow(hwnd);
+            return true;
+        }
+        catch when (!startedGfn)
+        {
+            return false;
+        }
+        finally
+        {
+            if (player != null)
+            {
+                try { if (!player.HasExited) player.Kill(); } catch { }
+                player.Dispose();
+            }
+        }
     }
 
     static void ShowSplashThenLaunchGfn(string splashPath, string gfnPath)
     {
-        var app = new Application();
-        app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+        var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
 
         var window = new Window
         {
@@ -86,7 +181,6 @@ static class Program
             ResizeMode = ResizeMode.NoResize
         };
 
-        // Decode GIF frames and per-frame delays
         var decoder = new GifBitmapDecoder(
             new Uri(splashPath),
             BitmapCreateOptions.PreservePixelFormat,
@@ -109,14 +203,8 @@ static class Program
             }
         }
 
-        var image = new Image
-        {
-            Source = frames[0],
-            Stretch = Stretch.Uniform
-        };
-
+        var image = new Image { Source = frames[0], Stretch = Stretch.Uniform };
         var fadeOverlay = new Border { Background = Brushes.Black, Opacity = 0 };
-
         var grid = new Grid();
         grid.Children.Add(image);
         grid.Children.Add(fadeOverlay);
@@ -138,7 +226,7 @@ static class Program
                 if (fadeOverlay.Opacity >= 1.0)
                 {
                     fadeTimer.Stop();
-                    StripTitleBar(gfnHwnd);
+                    ForceFullscreen(gfnHwnd);
                     LockSetForegroundWindow(LSFW_UNLOCK);
                     SetForegroundWindow(gfnHwnd);
                     window.Close();
@@ -152,35 +240,32 @@ static class Program
             if (gfnHwnd != IntPtr.Zero)
             {
                 FadeOutAndHandoff();
+                return;
             }
-            else
+
+            Task.Run(() =>
             {
-                Task.Run(() =>
+                for (int i = 0; i < 40; i++)
                 {
-                    for (int i = 0; i < 40; i++)
+                    Thread.Sleep(250);
+                    var hwnd = FindGfnMainHwnd();
+                    if (hwnd != IntPtr.Zero)
                     {
-                        Thread.Sleep(250);
-                        var proc = FindGfnProcess();
-                        if (proc != null && proc.MainWindowHandle != IntPtr.Zero)
-                        {
-                            gfnHwnd = proc.MainWindowHandle;
-                            app.Dispatcher.Invoke(FadeOutAndHandoff);
-                            return;
-                        }
+                        gfnHwnd = hwnd;
+                        app.Dispatcher.Invoke(FadeOutAndHandoff);
+                        return;
                     }
-                    app.Dispatcher.Invoke(() => window.Close());
-                });
-            }
+                }
+                app.Dispatcher.Invoke(() => window.Close());
+            });
         }
 
         window.ContentRendered += (_, _) =>
         {
             LockSetForegroundWindow(LSFW_LOCK);
 
-            // Animate GIF: cycle through frames with per-frame delays
             int frameIndex = 0;
-            var animTimer = new DispatcherTimer();
-            animTimer.Interval = TimeSpan.FromMilliseconds(delays[0]);
+            var animTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(delays[0]) };
             animTimer.Tick += (_, _) =>
             {
                 frameIndex++;
@@ -195,23 +280,21 @@ static class Program
             };
             animTimer.Start();
 
-            // Launch GFN AFTER splash is visible
             if (!gfnLaunched)
             {
                 gfnLaunched = true;
                 Process.Start(new ProcessStartInfo { FileName = gfnPath, UseShellExecute = true });
             }
 
-            // Detect GFN window handle (runs behind Topmost splash, not hidden)
             var detectTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
             detectTimer.Tick += (_, _) =>
             {
                 if (gfnHwnd != IntPtr.Zero) return;
-
-                var proc = FindGfnProcess();
-                if (proc != null && proc.MainWindowHandle != IntPtr.Zero)
+                var hwnd = FindGfnMainHwnd();
+                if (hwnd != IntPtr.Zero)
                 {
-                    gfnHwnd = proc.MainWindowHandle;
+                    gfnHwnd = hwnd;
+                    ForceFullscreen(hwnd);
                     detectTimer.Stop();
                 }
             };
@@ -227,47 +310,15 @@ static class Program
         app.Run(window);
     }
 
-    [DllImport("user32.dll")]
-    static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-
-    static bool IsGfnWindow(IntPtr hwnd)
+    static void MonitorGfn(EventWaitHandle launchEvent, string gfnPath)
     {
-        GetWindowThreadProcessId(hwnd, out uint pid);
-        try
-        {
-            var proc = Process.GetProcessById((int)pid);
-            return proc.ProcessName.Equals(GfnProcessName, StringComparison.OrdinalIgnoreCase);
-        }
-        catch { return false; }
-    }
+        DateTime lastSeen = DateTime.UtcNow;
 
-    static void EnsureAllGfnStripped()
-    {
-        var procs = Process.GetProcessesByName(GfnProcessName);
-        foreach (var proc in procs)
-        {
-            if (proc.MainWindowHandle != IntPtr.Zero)
-            {
-                long style = GetWindowLongPtr(proc.MainWindowHandle, GWL_STYLE);
-                if ((style & WS_CAPTION) != 0)
-                    StripTitleBar(proc.MainWindowHandle);
-            }
-            proc.Dispose();
-        }
-    }
-
-    static void MonitorGfn()
-    {
-        uint threadId = GetCurrentThreadId();
-
-        WinEventDelegate callback = (hook, eventType, hwnd, idObject, idChild, eventThread, eventTime) =>
+        WinEventDelegate callback = (_, __, hwnd, idObject, ___, ____, _____) =>
         {
             if (hwnd == IntPtr.Zero || idObject != OBJID_WINDOW) return;
-            if (!IsGfnWindow(hwnd)) return;
-
-            long style = GetWindowLongPtr(hwnd, GWL_STYLE);
-            if ((style & WS_CAPTION) != 0)
-                StripTitleBar(hwnd);
+            if (hwnd != FindGfnMainHwnd()) return;
+            ForceFullscreen(hwnd);
         };
 
         var pinned = GCHandle.Alloc(callback);
@@ -281,22 +332,37 @@ static class Program
 
         SetTimer(IntPtr.Zero, UIntPtr.Zero, 500, IntPtr.Zero);
 
-        Task.Run(() =>
-        {
-            while (true)
-            {
-                Thread.Sleep(2000);
-                var procs = Process.GetProcessesByName(GfnProcessName);
-                if (procs.Length == 0) break;
-                foreach (var p in procs) p.Dispose();
-            }
-            PostThreadMessage(threadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
-        });
-
         while (GetMessage(out var msg, IntPtr.Zero, 0, 0))
         {
             if (msg.message == WM_TIMER)
-                EnsureAllGfnStripped();
+            {
+                if (IsGfnRunning()) lastSeen = DateTime.UtcNow;
+                if (launchEvent.WaitOne(0))
+                {
+                    lastSeen = DateTime.UtcNow;
+                    var hwnd = FindGfnMainHwnd();
+                    bool launchGfn = hwnd == IntPtr.Zero;
+                    if (launchGfn && !IsGfnRunning()) EnsureNativeTitleBar();
+                    if (!ShowMpvSplash(gfnPath, launchGfn))
+                    {
+                        if (hwnd != IntPtr.Zero)
+                        {
+                            if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+                            ForceFullscreen(hwnd);
+                            SetForegroundWindow(hwnd);
+                        }
+                        else
+                        {
+                            try { Process.Start(new ProcessStartInfo { FileName = gfnPath, UseShellExecute = true }); }
+                            catch (Exception ex) { MessageBox.Show(ex.Message, "Could not start GeForce NOW", MessageBoxButton.OK, MessageBoxImage.Error); }
+                        }
+                    }
+                    lastSeen = DateTime.UtcNow;
+                }
+                var mainWindow = FindGfnMainHwnd();
+                if (mainWindow != IntPtr.Zero) ForceFullscreen(mainWindow);
+                if (DateTime.UtcNow - lastSeen > MonitorGraceAfterExit) break;
+            }
 
             TranslateMessage(ref msg);
             DispatchMessage(ref msg);
@@ -308,51 +374,131 @@ static class Program
         pinned.Free();
     }
 
-    static void WaitAndStripTitleBar()
+    static void WaitAndForceFullscreen()
     {
         for (int i = 0; i < 60; i++)
         {
             Thread.Sleep(500);
-            var proc = FindGfnProcess();
-            if (proc != null && proc.MainWindowHandle != IntPtr.Zero)
+            var hwnd = FindGfnMainHwnd();
+            if (hwnd != IntPtr.Zero)
             {
-                StripTitleBar(proc.MainWindowHandle);
+                ForceFullscreen(hwnd);
                 return;
             }
         }
     }
 
-    static void StripTitleBar(IntPtr hwnd)
+    static void ForceFullscreen(IntPtr hwnd)
     {
-        if (hwnd == IntPtr.Zero)
+        if (hwnd == IntPtr.Zero || !IsWindowVisible(hwnd) || IsIconic(hwnd))
             return;
 
+        // Restoring first is required when GFN is in WS_MAXIMIZE state; otherwise
+        // SetWindowPos fights the maximized chrome (-6,-6 offsets).
         long style = GetWindowLongPtr(hwnd, GWL_STYLE);
-        style &= ~(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU |
-                   WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_MAXIMIZE);
-        style |= WS_POPUP;
-        SetWindowLongPtr(hwnd, GWL_STYLE, (IntPtr)style);
+        if ((style & WS_MAXIMIZE) != 0 || (style & WS_CAPTION) != 0)
+            ShowWindow(hwnd, SW_RESTORE);
 
-        int w = GetSystemMetrics(SM_CXSCREEN);
-        int h = GetSystemMetrics(SM_CYSCREEN);
-        SetWindowPos(hwnd, IntPtr.Zero, 0, 0, w, h, SWP_FRAMECHANGED | SWP_NOZORDER);
+        style = GetWindowLongPtr(hwnd, GWL_STYLE);
+        long desired = style;
+        desired &= ~(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU |
+                     WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_MAXIMIZE);
+        desired |= WS_POPUP;
+
+        if (desired != style)
+            SetWindowLongPtr(hwnd, GWL_STYLE, (IntPtr)desired);
+
+        long ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+        long desiredEx = ex & ~(WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME | WS_EX_STATICEDGE);
+        if (desiredEx != ex)
+            SetWindowLongPtr(hwnd, GWL_EXSTYLE, (IntPtr)desiredEx);
+
+        GetWindowRect(hwnd, out var rect);
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        bool covers = rect.Left <= 0 && rect.Top <= 0 &&
+                      rect.Right >= screenW && rect.Bottom >= screenH;
+
+        if (!covers || desired != style || desiredEx != ex)
+        {
+            SetWindowPos(hwnd, IntPtr.Zero, 0, 0, screenW, screenH,
+                SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW);
+        }
     }
 
+    // NVIDIA updates can restore custom chrome. Patch only while GFN is stopped.
     static void EnsureNativeTitleBar()
     {
         var jsonPath = ResolveGfnJsonPath();
         if (jsonPath == null) return;
-
         try
         {
             var content = File.ReadAllText(jsonPath);
-            var replaced = content.Replace(
-                "nv-custom-black-window=true",
-                "nv-custom-black-window=false");
-            if (replaced != content)
-                File.WriteAllText(jsonPath, replaced);
+            var replaced = content.Replace("nv-custom-black-window=true", "nv-custom-black-window=false");
+            if (replaced != content) File.WriteAllText(jsonPath, replaced);
         }
-        catch { }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    static bool IsGfnRunning()
+    {
+        var procs = Process.GetProcessesByName(GfnProcessName);
+        bool any = procs.Length > 0;
+        foreach (var p in procs) p.Dispose();
+        return any;
+    }
+
+    [DllImport("user32.dll")]
+    static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    static bool IsGfnWindow(IntPtr hwnd)
+    {
+        GetWindowThreadProcessId(hwnd, out uint pid);
+        try
+        {
+            using var proc = Process.GetProcessById((int)pid);
+            return proc.ProcessName.Equals(GfnProcessName, StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    static IntPtr FindGfnMainHwnd()
+    {
+        IntPtr best = IntPtr.Zero;
+        long bestArea = 0;
+
+        foreach (var hwnd in EnumGfnWindows())
+        {
+            if (!GetWindowRect(hwnd, out var r)) continue;
+            long area = IsIconic(hwnd) ? 1 : (long)Math.Max(0, r.Right - r.Left) * Math.Max(0, r.Bottom - r.Top);
+            if (area > bestArea)
+            {
+                bestArea = area;
+                best = hwnd;
+            }
+        }
+
+        return best;
+    }
+
+    static List<IntPtr> EnumGfnWindows()
+    {
+        var result = new List<IntPtr>();
+        EnumWindows((hwnd, _) =>
+        {
+            if (!IsWindowVisible(hwnd)) return true;
+            if (!IsGfnWindow(hwnd)) return true;
+            if (GetWindow(hwnd, GW_OWNER) != IntPtr.Zero) return true;
+            // Skip tool/owned popups with no title and tiny size
+            GetWindowRect(hwnd, out var r);
+            int w = r.Right - r.Left;
+            int h = r.Bottom - r.Top;
+            if (!IsIconic(hwnd) && (w < 200 || h < 200)) return true;
+            result.Add(hwnd);
+            return true;
+        }, IntPtr.Zero);
+        return result;
     }
 
     static string? ResolveGfnJsonPath()
@@ -362,29 +508,16 @@ static class Program
         return File.Exists(path) ? path : null;
     }
 
-    static Process? FindGfnProcess()
-    {
-        var procs = Process.GetProcessesByName(GfnProcessName);
-        foreach (var p in procs)
-        {
-            if (p.MainWindowHandle != IntPtr.Zero)
-                return p;
-        }
-        return procs.Length > 0 ? procs[0] : null;
-    }
-
     static string? ResolveGfnPath()
     {
         var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        return File.Exists(Path.Combine(localAppData, GfnRelativePath))
-            ? Path.Combine(localAppData, GfnRelativePath)
-            : null;
+        var path = Path.Combine(localAppData, GfnRelativePath);
+        return File.Exists(path) ? path : null;
     }
 
     static string? FindSplashPath()
     {
-        var exeDir = AppContext.BaseDirectory;
-        var path = Path.Combine(exeDir, "nvidia.gif");
+        var path = Path.Combine(AppContext.BaseDirectory, "nvidia.gif");
         return File.Exists(path) ? path : null;
     }
 
@@ -398,7 +531,7 @@ static class Program
         {
             var exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName;
             if (exe != null)
-                key.SetValue(RunKeyName, $"\"{exe}\" --launch");
+                key.SetValue(RunKeyName, $"\"{exe}\"");
         }
         else
         {
@@ -409,6 +542,7 @@ static class Program
     // ── Win32 Interop ───────────────────────────────────────────
 
     const int GWL_STYLE = -16;
+    const int GWL_EXSTYLE = -20;
     const long WS_CAPTION = 0x00C00000L;
     const long WS_THICKFRAME = 0x00040000L;
     const long WS_SYSMENU = 0x00080000L;
@@ -416,12 +550,25 @@ static class Program
     const long WS_MAXIMIZEBOX = 0x00010000L;
     const long WS_MAXIMIZE = 0x01000000L;
     const long WS_POPUP = 0x80000000L;
+    const long WS_EX_WINDOWEDGE = 0x00000100L;
+    const long WS_EX_CLIENTEDGE = 0x00000200L;
+    const long WS_EX_DLGMODALFRAME = 0x00000001L;
+    const long WS_EX_STATICEDGE = 0x00020000L;
 
     const int SM_CXSCREEN = 0;
     const int SM_CYSCREEN = 1;
+    const int SW_RESTORE = 9;
+    const uint GW_OWNER = 4;
 
     const uint SWP_FRAMECHANGED = 0x0020;
     const uint SWP_NOZORDER = 0x0004;
+    const uint SWP_SHOWWINDOW = 0x0040;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct RECT
+    {
+        public int Left, Top, Right, Bottom;
+    }
 
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
     static extern long GetWindowLongPtr(IntPtr hWnd, int nIndex);
@@ -437,6 +584,22 @@ static class Program
     static extern int GetSystemMetrics(int nIndex);
 
     [DllImport("user32.dll")]
+    static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+    [DllImport("user32.dll")]
+    static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     static extern bool SetForegroundWindow(IntPtr hWnd);
 
@@ -445,7 +608,10 @@ static class Program
     const uint LSFW_LOCK = 1;
     const uint LSFW_UNLOCK = 2;
 
-    // ── Event Hook Interop ──────────────────────────────────────
+    delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
     delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType,
         IntPtr hwnd, int idObject, int idChild, uint eventThread, uint eventTime);

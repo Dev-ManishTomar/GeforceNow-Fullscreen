@@ -6,14 +6,15 @@ A lightweight Windows launcher that runs NVIDIA GeForce NOW in true borderless f
 
 - Strips the GeForce NOW title bar and window chrome at launch
 - Resizes the window to cover the full screen (no taskbar bleed)
-- Shows an animated NVIDIA splash (GIF) while GFN loads, with a smooth fade-to-black transition
-- Prevents GFN from stealing focus during the splash using `LockSetForegroundWindow`
+- Plays the NVIDIA splash through MPV while GFN loads, holding the final black frame until it is ready
+- Keeps the MPV splash above GFN during startup
 - Registers itself to auto-start with Windows
 
 ## Requirements
 
-- Windows 10/11 (built for 22H2+)
+- Windows 11 22H2 or newer
 - .NET 9 SDK (only needed to build from source)
+- MPV at `C:\Program Files\MPV Player\mpv.exe` (the GIF splash is used as a fallback)
 - GeForce NOW installed via the default path (`%LOCALAPPDATA%\NVIDIA Corporation\GeForceNOW\CEF\`)
 
 ## Build
@@ -22,25 +23,17 @@ A lightweight Windows launcher that runs NVIDIA GeForce NOW in true borderless f
 dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
 ```
 
-The output is a single `GfnFullscreen.exe` in the publish folder. Copy `nvidia.gif` into the same folder as the exe.
+The publish folder contains `GfnFullscreen.exe`, supporting Windows libraries, `nvidia-splash.mp4`, `nvidia.gif`, `GeForceNOW.ico`, and `setup.ps1`. Copy the entire folder to the Ally; keep the files together.
 
 ## Setup
 
-1. **Place the files** -- Put `GfnFullscreen.exe` and `nvidia.gif` in any folder (e.g. `C:\GfnFullscreen\`).
+1. **Place the files** -- Put the entire published output in any folder (e.g. `C:\GfnFullscreen\`).
 
-2. **Register auto-start** (optional) -- Run once to launch GFN in fullscreen automatically on every boot:
-   ```
-   GfnFullscreen.exe --install
-   ```
+2. **Create the desktop shortcut** -- In PowerShell, run `.\setup.ps1` from the published folder. It creates **GeForce NOW** on the desktop with the original NVIDIA icon. Run `.\setup.ps1 -EnableAutoStart` instead if you also want the launcher to start at Windows sign-in.
 
-3. **Replace the desktop shortcut** (optional) -- If you want the GeForce NOW desktop shortcut to use the launcher instead of the stock app:
-   - Right-click the **NVIDIA GeForce NOW** shortcut on your desktop and select **Properties**
-   - Change the **Target** to the full path of `GfnFullscreen.exe` (e.g. `C:\GfnFullscreen\GfnFullscreen.exe`)
-   - Click **OK**
+3. **Use the shortcut** -- Double-click **GeForce NOW**. You can remove NVIDIA's separate desktop shortcut if you prefer one icon. NVIDIA updates may recreate its shortcut, but the separately named launcher shortcut should remain in place.
 
-   Now double-clicking the shortcut launches GFN through the fullscreen launcher with the splash screen.
-
-4. **Run it** -- Double-click the shortcut or exe. The splash plays, then GFN appears in borderless fullscreen.
+The icon is a multi-resolution copy extracted from the installed GeForce NOW executable.
 
 ## Usage
 
@@ -52,12 +45,13 @@ GfnFullscreen.exe --uninstall  # Remove auto-start
 
 ## How it works
 
-1. On launch, displays `nvidia.gif` as a fullscreen splash
-2. Locks foreground window ownership so GFN can't steal focus
-3. Starts GeForce NOW behind the splash (visible to the OS but covered by the splash)
-4. When the GIF finishes, fades to black and hands off to GFN fullscreen
-5. If GFN is already running, just strips its title bar and exits
+1. Before starting GeForce NOW, changes `nv-custom-black-window=true` to `false` in `GeForceNOW.json` if an update reset it. An already running session is not interrupted; the setting is applied on the next launch after GeForce NOW exits.
+2. Plays `nvidia-splash.mp4` fullscreen through MPV while GeForce NOW starts, and holds the final frame until its window is ready. Repeat shortcut launches also play the splash.
+3. Removes the main window's chrome and sizes it to the screen, watching for window changes and updater restarts for up to three minutes after exit.
+4. A second shortcut launch tells the running launcher to bring GeForce NOW forward or start it again. The launcher does not repeatedly restore a window you minimized.
+
+If a GeForce NOW update replaces its own desktop shortcut, use the separate **GeForce NOW** shortcut. Changes to this source only take effect after rebuilding and replacing the launcher executable on the Ally.
 
 ## Customization
 
-Replace `nvidia.gif` with any GIF to use as your splash screen. The launcher reads frame delays from the GIF metadata and plays it at native speed.
+Replace `nvidia-splash.mp4` with a roughly three-second video ending in black to customize the MPV splash. `nvidia.gif` remains the fallback when MPV or the video is unavailable.
